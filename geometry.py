@@ -1,123 +1,108 @@
-# Contributor: César Benito Lamata @cesarBLG
-
 from hardware.utils.execution import backends_objs_to_names
-from hardware.utils.plotting import best_text_color
+from collections.abc import Iterable, Sequence
+from matplotlib.typing import ColorType
+from qiskit.providers import BackendV2
 from functools import cached_property
 import matplotlib.pyplot as plt
+import numpy.typing as npt
 import matplotlib as mpl
 import numpy as np
+import os
 
-# Stores qubit index and coordinates for every vertex (matter qubit)
-# Two types of nodes: downwards and upwards (for the schedule)
-class vertex:
-    def __init__(self, coords, qubit):
-        self.coords = coords
-        self.qubit = qubit
-        self.downwards = (coords[0]+coords[1])%2 == 1
+type Coords = tuple[float, float]
 
-    def __repr__(self):
-        return f"<Vertex {self.coords} -> Qb: {self.qubit}>"
-    
-# Stores qubit index and coordinates for every edge (gauge qubit)
-# Type indicates link direction (not used)
-# Color represents a three-colouring of all links (not used)
-class edge:
-    def __init__(self, coords, qubit):
-        self.coords = coords
-        self.qubit = qubit
+def _num_half_integer_entries(coords: Coords | Sequence[Coords] | npt.NDArray) -> int | npt.NDArray:
+    """Number of half-integer entries of a (row, column) tuple, or of each row of an N x 2 array:
+    0 for a node, 1 for a link and 2 for an ancilla
+    """
+    single = isinstance(coords, tuple)
+    coords_arr = np.asarray([coords] if single else coords, dtype=float)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 2:
+        raise np.exceptions.AxisError("Coords is not a valid tuple or N x 2 array")
+    fractional = coords_arr % 1
+    if not np.all((fractional == 0) | (fractional == 0.5)):
+        raise ValueError("Coordinates must be integers or half-integers")
+    counts = np.count_nonzero(fractional == 0.5, axis=1)
+    return int(counts[0]) if single else counts
 
-    def __repr__(self):
-        return f"<Edge {self.coords} -> Qb: {self.qubit}>"
-    
-def is_edge_coords(coords):
-    if type(coords) == tuple:
-        return (coords[0] % 1 != 0) or (coords[1] % 1 != 0)
-    else:
-        try:
-            coords = np.array(coords)
-            return ~np.equal(coords.sum(axis=1) % 1, 0)
-        except np.AxisError:
-            raise np.AxisError("Coords is not a valid tuple or N x 2 array")
+def is_node_coords(coords: Coords | Sequence[Coords] | npt.NDArray) -> bool | npt.NDArray:
+    return _num_half_integer_entries(coords) == 0
+
+def is_link_coords(coords: Coords | Sequence[Coords] | npt.NDArray) -> bool | npt.NDArray:
+    return _num_half_integer_entries(coords) == 1
+
+def is_ancilla_coords(coords: Coords | Sequence[Coords] | npt.NDArray) -> bool | npt.NDArray:
+    return _num_half_integer_entries(coords) == 2
     
 class Lattice:
-    def __init__(self, coords):
+    def __init__(self, coords: Iterable[Coords]) -> None:
         self.coords = sorted(coords)
-        self.edges = {}
-        self.vertices = {}
-        for i, c in enumerate(self.coords):
-            if is_edge_coords(c):
-                self.edges[c] = edge(c, i)
-            else:
-                self.vertices[c] = vertex(c, i)
+        kinds = _num_half_integer_entries(self.coords)
+        self.node_qbinds: list[int] = np.flatnonzero(kinds == 0).tolist()
+        self.link_qbinds: list[int] = np.flatnonzero(kinds == 1).tolist()
+        self.ancilla_qbinds: list[int] = np.flatnonzero(kinds == 2).tolist()
+        self.node_coords = [self.coords[i] for i in self.node_qbinds]
+        self.link_coords = [self.coords[i] for i in self.link_qbinds]
+        self.ancilla_coords = [self.coords[i] for i in self.ancilla_qbinds]
 
     @cached_property
-    def node_coords(self):
-        return list(self.vertices.keys())
-    
-    @cached_property
-    def node_qbinds(self):
-        return [i for i, coords in enumerate(self.coords) if coords in self.node_coords]
-
-    @cached_property
-    def edge_coords(self):
-        return list(self.edges.keys())
-    
-    @cached_property
-    def edge_qbinds(self):
-        return [i for i, coords in enumerate(self.coords) if coords in self.edge_coords]
-    
-    @cached_property
-    def max_x(self):
+    def max_x(self) -> float:
         return max([coords[1] for coords in self.coords])
     
     @cached_property
-    def min_x(self):
+    def min_x(self) -> float:
         return min([coords[1] for coords in self.coords])
     
     @cached_property
-    def max_y(self):
+    def max_y(self) -> float:
         return max([coords[0] for coords in self.coords])
     
     @cached_property
-    def min_y(self):
+    def min_y(self) -> float:
         return min([coords[0] for coords in self.coords])
     
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.coords)
 
-    def coords_to_logical_qb(self, coords):
+    def coords_to_logical_qb(self, coords: Coords | Sequence[Coords]) -> int | list[int]:
         if isinstance(coords, tuple):
             coords = [tuple(coords)]
         to_return = [self.coords.index((coord[0], coord[1])) for coord in coords]
         return to_return if len(to_return) > 1 else to_return[0]
+
+    def neighborhood(self, coords: Coords) -> list[Coords]:
+        """Returns the coordinates of the qubits connected to the qubit at coords"""
+        min_dist = 0.5 if len(self.link_coords) > 0 or len(self.ancilla_coords) > 0 else 1
+        candidate_directions = [(0, min_dist), (0, -min_dist), (min_dist, 0), (-min_dist, 0)]
+        candidate_coords = coords + np.array(candidate_directions)
+        return sorted([tuple(c) for c in candidate_coords if tuple(c) in self.coords])
     
-    def edges_connected_to_node(self, node_coords):
-        connected_edges_coords = []
-        for coords in self.coords:
-            if (0 <= (dx := abs(node_coords[0] - coords[0])) < 1) and (0 <= (dy := abs(node_coords[1] - coords[1])) < 1):
-                if not (dx == 0 and dy == 0):
-                    connected_edges_coords.append(coords)
-        return connected_edges_coords
-    
-    def nodes_connected_to_edge(self, edge_coords):
-        return (np.floor(edge_coords[0]).astype(int), np.floor(edge_coords[1]).astype(int)), (np.ceil(edge_coords[0]).astype(int), np.ceil(edge_coords[1]).astype(int))
-    
-    def plot(self, scale=1.5, number_qubits=False, first_qubit=0, edge_boxes=False, highlighted_qubits=None, colors=None, filepath=None):
+    def plot(self, scale: float = 1.5, number_qubits: bool = False, first_qubit: int | None = 0, link_boxes: bool = True, highlighted_qubits: Sequence[int] | None = None, colors: ColorType | list[ColorType] | npt.NDArray | None = None, filepath: str | os.PathLike | None = None) -> None:
         plt.rc("font", family="serif")
-        vertex_x = np.array([v[1] for v in sorted(list(self.vertices.keys()))], dtype=int)
-        vertex_y = np.array([self.max_y - v[0] for v in sorted(list(self.vertices.keys()))], dtype=int)
-        edges_endpoints_x = np.array([[np.floor(e[1]), np.ceil(e[1])] for e in sorted(list(self.edges.keys()))], dtype=int)
-        edges_endpoints_y = np.array([[self.max_y - np.floor(e[0]), self.max_y - np.ceil(e[0])] for e in sorted(list(self.edges.keys()))], dtype=int)
-        edges_boxes_x = np.mean(edges_endpoints_x, axis=1)
-        edges_boxes_y = np.mean(edges_endpoints_y, axis=1)
-        
+        node_x = np.array([n[1] for n in self.node_coords], dtype=int)
+        node_y = np.array([self.max_y - n[0] for n in self.node_coords], dtype=int)
+        # reshape keeps the N x 2 shape when the lattice has no links
+        links_endpoints_x = np.array([[np.floor(link[1]), np.ceil(link[1])] for link in self.link_coords], dtype=int).reshape(-1, 2)
+        links_endpoints_y = np.array([[self.max_y - np.floor(link[0]), self.max_y - np.ceil(link[0])] for link in self.link_coords], dtype=int).reshape(-1, 2)
+        links_boxes_x = np.mean(links_endpoints_x, axis=1)
+        links_boxes_y = np.mean(links_endpoints_y, axis=1)
+        ancilla_x = np.array([a[1] for a in self.ancilla_coords])
+        ancilla_y = np.array([self.max_y - a[0] for a in self.ancilla_coords])
+
         fig, ax = plt.subplots(figsize=[scale*self.max_x, scale*self.max_y])
         ax.set_aspect('equal')
-        for exs, eys in zip(edges_endpoints_x, edges_endpoints_y):
-            plt.plot(exs, eys, color="black")
-        plt.scatter(vertex_x, vertex_y, 350*scale, marker="o", c="white", edgecolors="black", zorder=2)
-        if edge_boxes:
-            plt.scatter(edges_boxes_x, edges_boxes_y, 400*scale, marker=(4, 0, 45), c="white", edgecolors="black", zorder=2)
+        for lxs, lys in zip(links_endpoints_x, links_endpoints_y):
+            plt.plot(lxs, lys, color="black")
+        # Dashed lines from each ancilla to its nearest qubits, at distance 0.5 (not the diagonal ones at 0.5*sqrt(2))
+        for a in self.ancilla_coords:
+            for c in self.coords:
+                if np.isclose(np.hypot(c[0] - a[0], c[1] - a[1]), 0.5):
+                    plt.plot([a[1], c[1]], [self.max_y - a[0], self.max_y - c[0]], color="black", linestyle="--", zorder=1)
+        plt.scatter(node_x, node_y, 350*scale, marker="o", c="white", edgecolors="black", zorder=2)
+        if link_boxes:
+            plt.scatter(links_boxes_x, links_boxes_y, 400*scale, marker=(4, 0, 45), c="white", edgecolors="black", zorder=2)
+        if self.ancilla_coords:
+            plt.scatter(ancilla_x, ancilla_y, 350*scale, marker="h", c="white", edgecolors="black", zorder=2)
         if highlighted_qubits is not None:
             if colors is not None:
                 if isinstance(colors, (str, tuple)):
@@ -131,14 +116,15 @@ class Lattice:
                 colors = ["#2f64f7"]*len(highlighted_qubits)
             for qb_ind in highlighted_qubits:
                 coords = self.coords[qb_ind]
-                if is_edge_coords(coords):
-                    x = (np.floor(coords[1]) + np.ceil(coords[1])) / 2
-                    y = self.max_y - (np.floor(coords[0]) + np.ceil(coords[0])) / 2
-                    plt.scatter(x, y, 400*scale, marker=(4, 0, 45), c=colors[highlighted_qubits.index(qb_ind)], edgecolors="black", zorder=3)
+                x = coords[1]
+                y = self.max_y - coords[0]
+                color = colors[highlighted_qubits.index(qb_ind)]
+                if is_node_coords(coords):
+                    plt.scatter(x, y, 350*scale, marker="o", c=color, edgecolors="black", zorder=3)
+                elif is_link_coords(coords):
+                    plt.scatter(x, y, 400*scale, marker=(4, 0, 45), c=color, edgecolors="black", zorder=3)
                 else:
-                    x = coords[1]
-                    y = self.max_y - coords[0]
-                    plt.scatter(x, y, 350*scale, marker="o", c=colors[highlighted_qubits.index(qb_ind)], edgecolors="black", zorder=3)
+                    plt.scatter(x, y, 350*scale, marker="h", c=color, edgecolors="black", zorder=3)
         if number_qubits:
             start = 0 if first_qubit is None else first_qubit
             labels = [str(start + i) for i in range(len(self.coords))]
@@ -155,13 +141,13 @@ class Lattice:
         plt.rcdefaults()
 
 class HeavyHexLattice(Lattice):
-    def __init__(self, plaq_width, plaq_height):
+    def __init__(self, plaq_width: int, plaq_height: int) -> None:
         self.plaquettes_width = plaq_width
         self.plaquettes_height = plaq_height
         width=plaq_width*2+1
         height=plaq_height
-        edge_coords = []
-        vertex_coords = []
+        link_coords = []
+        node_coords = []
         for i in range(height+1):
             for j in range(width+1):
                 if i==0 and j == 0:
@@ -171,7 +157,7 @@ class HeavyHexLattice(Lattice):
                         continue
                     if j == width and i%2 == 0:
                         continue
-                vertex_coords.append((i,j))
+                node_coords.append((i,j))
         for i in range(height+1):
             for j in range(width):
                 if i==0 and j == 0:
@@ -181,18 +167,18 @@ class HeavyHexLattice(Lattice):
                         continue
                     if j == width-1 and i%2 == 0:
                         continue
-                edge_coords.append((i, j+0.5))
+                link_coords.append((i, j+0.5))
         for i in range(height):
             if i%2 == 0:
                 for j in range((width+1)//2):
-                    edge_coords.append((i+0.5, 2*j+1))
+                    link_coords.append((i+0.5, 2*j+1))
             else:
                 for j in range(width//2+1):
-                    edge_coords.append((i+0.5, 2*j))
-        super().__init__(vertex_coords + edge_coords)
+                    link_coords.append((i+0.5, 2*j))
+        super().__init__(node_coords + link_coords)
 
     @staticmethod
-    def get_backend_coordinates(backend):
+    def get_backend_coordinates(backend: BackendV2 | str) -> list[tuple[int, int]]:
         """Returns a list with the qubit coordinates of the specified backend
         """
         backend_name = backends_objs_to_names(backend)
@@ -233,7 +219,7 @@ class HeavyHexLattice(Lattice):
                     ibm_qubit_coords.append((4*i+3, 4*j+2))
         return sorted(ibm_qubit_coords)
 
-    def get_all_layouts(self, backend=None, exclude_automorphisms=False):
+    def get_all_layouts(self, backend: BackendV2 | str, exclude_automorphisms: bool = False) -> list[list[int]]:
         """Returns a list of all possible mappings from own qubit indices to ibm physical qubits
         Possible isomorphisms are reflections and 60º rotations
         Arguments:
@@ -242,11 +228,11 @@ class HeavyHexLattice(Lattice):
         """
         # Gets the new rows and columns after a 60º rotation
         # A bit cumbersome due to the brick-wall layout instead of regular hexagons
-        def rotated_row(r,c):
+        def rotated_row(r: float, c: float) -> float:
             if r != int(r):
                 return int(c)//2+1+int(r-0.5)//2
             return [0,0.5,1,1][int(2*r+2*c)%4]+int(r)//2+int(2*(c+r%2))//4
-        def rotated_column(r,c):
+        def rotated_column(r: float, c: float) -> float:
             if r != int(r):
                 return -(int(c)//2)+0.5+3*(int(r-0.5)//2)+2*(int(r-0.5)%2)
             return [0,0,0,-0.5][int(2*r+2*c)%4]+int(3*r)//2-(int(2*(c-r%2))//4)
@@ -293,24 +279,44 @@ class HeavyHexLattice(Lattice):
         return layouts
 
 class HeronHeavyHex(Lattice):
-    def __init__(self, plaq_width, plaq_height):
+    def __init__(self, plaq_width: int, plaq_height: int) -> None:
         self.plaquettes_width = plaq_width
         self.plaquettes_height = plaq_height
         width=plaq_width*2+1
         height=plaq_height
-        edge_coords = []
-        vertex_coords = []
+        link_coords = []
+        node_coords = []
         for i in range(height+1):
             for j in range(0, width+1):
-                vertex_coords.append((i,j))
+                node_coords.append((i,j))
         for i in range(height+1):
             for j in range(-1, width):
-                edge_coords.append((i, j+0.5))
+                link_coords.append((i, j+0.5))
         for i in range(height):
             if i%2 == 0:
                 for j in range((width+1)//2):
-                    edge_coords.append((i+0.5, 2*j+1))
+                    link_coords.append((i+0.5, 2*j+1))
             else:
                 for j in range(width//2+1):
-                    edge_coords.append((i+0.5, 2*j))
-        super().__init__(vertex_coords + edge_coords)
+                    link_coords.append((i+0.5, 2*j))
+        super().__init__(node_coords + link_coords)
+
+class SquareLattice(Lattice):
+    def __init__(self, nodes_x: int, nodes_y: int) -> None:
+        self.nodes_x = nodes_x
+        self.nodes_y = nodes_y
+        coords = []
+        for i in range(nodes_y):
+            for j in range(nodes_x):
+                coords.append((i,j))
+        super().__init__(coords)
+
+class LGTSquareLattice(Lattice):
+    def __init__(self, plaquette_width: int, plaquette_height: int) -> None:
+        self.plaquette_width = plaquette_width
+        self.plaquette_height = plaquette_height
+        coords = []
+        for x in np.arange(0, plaquette_width+0.5, 0.5):
+            for y in np.arange(0, plaquette_height+0.5, 0.5):
+                coords.append((y,x))
+        super().__init__(coords)

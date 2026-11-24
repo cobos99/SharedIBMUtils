@@ -1,19 +1,68 @@
-from qiskit_ibm_runtime.exceptions import RuntimeJobFailureError, RuntimeInvalidStateError
+from qiskit_ibm_runtime.quantum_program.params_converters import QUANTUM_PROGRAM_PARAMS_CONVERTERS
+from qiskit_ibm_runtime.decoders.executor.decoder import ExecutorResultDecoder
+from qiskit_ibm_runtime.decoders.result_decoder import ResultDecoder
+from qiskit_ibm_runtime import QiskitRuntimeService, RuntimeJobV2
 from qiskit_ibm_runtime.results import QuantumProgramResult
-from qiskit_ibm_runtime import RuntimeDecoder, RuntimeEncoder
-from qiskit.primitives import PrimitiveResult
-from utils.samples import group_multirep_samples_dicts
-import utils.execution as execution
-import dataclasses
+from qiskit_ibm_runtime.json import RuntimeDecoder
+from hardware.utils.circs import depth2qb
+from collections.abc import Sequence
+from typing import Any, NamedTuple
 import numpy as np
-import warnings
 import json
 import os
 
-class ExecDB:
-    """Database for saving jobs"""
-    def __init__(self, path):
+type Batch = dict[str, Any]
+
+class SavedJob(NamedTuple):
+    job_id: str
+    backend: str | None
+    inputs: dict[str, Any]
+    result: QuantumProgramResult
+
+def save_job(job: RuntimeJobV2, path: str | os.PathLike) -> None:
+    inputs = job.inputs
+    converter = QUANTUM_PROGRAM_PARAMS_CONVERTERS[inputs["schema_version"]]
+    backend = job.backend()
+    with open(path, "w") as f:
+        json.dump({
+            "id": job.job_id(),
+            "backend": backend.name if backend is not None else None,
+            "program": {"id": "executor"},
+            "params": converter.encoder(inputs["quantum_program"], inputs["options"]).model_dump(mode="json"),
+            "result": job.result(decoder=ResultDecoder),
+        }, f)
+
+def load_job(path: str | os.PathLike) -> SavedJob:
+    with open(path, "r") as f:
+        saved = json.load(f, cls=RuntimeDecoder)
+    result = ExecutorResultDecoder.decode(json.dumps(saved["result"]))
+    if not isinstance(result, QuantumProgramResult):
+        raise ValueError(f"{path} does not hold the result of an executor job")
+    return SavedJob(saved["id"], saved["backend"], saved["params"], result)
+
+def load_jobs_from_local_or_ibmq(job_ids: Sequence[str], ibmq_service: QiskitRuntimeService | None, jobs_local_folder: str | os.PathLike = "", verbose: bool = False) -> list[RuntimeJobV2 | SavedJob]:
+    jobs = []
+    for job_id in job_ids:
+        local_path = os.path.join(jobs_local_folder, f"{job_id}.json")
+        if os.path.exists(local_path):
+            if verbose:
+                print(f"Loading job {job_id} from local file {local_path}")
+            jobs.append(load_job(local_path))
+        else:
+            if ibmq_service is None:
+                raise ValueError(f"Job {job_id} is not saved in {local_path} and no ibmq_service was given to download it")
+            if verbose:
+                print(f"Loading job {job_id} from IBM Cloud")
+            this_job = ibmq_service.job(job_id=job_id)
+            save_job(this_job, local_path)
+            jobs.append(load_job(local_path))
+    return jobs
+
+class JobDB:
+    def __init__(self, path: str | os.PathLike, jobs_local_folder: str | os.PathLike = "") -> None:
         self.path = path
+        self._data: list[Batch]
+        self.jobs_local_folder = jobs_local_folder
         if os.path.exists(path):
             with open(path, "r") as f:
                 self._data = json.load(f)
@@ -22,34 +71,69 @@ class ExecDB:
             with open(path, "w") as f:
                 json.dump(self._data, f, indent=4)
 
-    def reload(self):
+    def reload(self) -> None:
         with open(self.path, "r") as f:
             self._data = json.load(f)
 
-    def save(self):
-        with open(self.path, "w") as f:
-            json.dump(self._data, f, indent=4)
+    def save(self) -> None:
+        text = json.dumps(self._data, indent=4)
+        temporary_path = os.fspath(self.path) + ".tmp"
+        with open(temporary_path, "w") as f:
+            f.write(text)
+        os.replace(temporary_path, self.path)
 
-    def _search_batches_indices_by_params(self, batch_args, observable_func_name, limit=10):
+    @classmethod
+    def generate_batch_db_data(cls, batch_args: dict[str, Any], jobs_arr: Sequence[RuntimeJobV2]) -> Batch:
+        data_to_add = batch_args.copy()
+        jobs_arr = np.array(jobs_arr, dtype=object)
+        data_to_add["jobs_shape"] = jobs_arr.shape
+        jobs_arr = jobs_arr.flatten()
+        job_circuits = [[item.circuit for item in job.inputs["quantum_program"].items] for job in jobs_arr]
+        data_to_add["jobs"] = [{
+            "job_id": job.job_id(),
+            "circuits": [{
+                "depth": circuit.depth(),
+                "depth2qb": depth2qb(circuit),
+                "nops": circuit.count_ops(),
+                "nqubits": circuit.num_qubits,
+                "layout": circuit.layout.final_index_layout() if circuit.layout is not None else None
+            } for circuit in job_circuits[i]]
+        } for i, job in enumerate(jobs_arr)]
+        return data_to_add
+
+    def add(self, batch_args: dict[str, Any], jobs_arr: Sequence[RuntimeJobV2]) -> None:
+        self.reload()
+        thisid = 0 if len(self._data) == 0 else self._data[-1]["id"] + 1
+        data_to_add = {"id": thisid}
+        data_to_add = data_to_add | self.generate_batch_db_data(batch_args, jobs_arr)
+        self._data.append(json.loads(json.dumps(data_to_add)))
+        self.save()
+
+    def remove(self, id: int) -> None:
+        self.reload()
+        index = self._search_batch_index_by_id(id)
+        self._data.pop(index)
+        self.save()
+
+    def _search_batches_indices_by_params(self, batch_args: dict[str, Any], limit: int = 10) -> list[int]:
+        batch_args = json.loads(json.dumps(batch_args))
         indices_to_return = []
-        observable_func_name = observable_func_name.__name__ if callable(observable_func_name) else observable_func_name
         for i, batch in enumerate(self._data[::-1]):
             is_equal = ([
                 batch.get(key, None) == val for key, val in batch_args.items()
-            ])# + [
-            #    batch["observables_func_name"] == observable_func_name
-            #])
+            ])
             if all(is_equal): indices_to_return.append(len(self._data) - 1 - i)
             if len(indices_to_return) >= limit: break
         return indices_to_return
-    
-    def _search_batch_index_by_id(self, id):
+
+    def _search_batch_index_by_id(self, id: int) -> int:
         for i, batch in enumerate(self._data):
             if batch["id"] == id:
                 return i
         raise ValueError(f"No batch found with id: {id}")
-    
-    def _search_batch_index_by_data(self, data):
+
+    def _search_batch_index_by_data(self, data: Batch) -> int:
+        data = json.loads(json.dumps(data))
         for i, batch in enumerate(self._data):
             batch_without_id = batch.copy()
             del batch_without_id["id"]
@@ -57,289 +141,20 @@ class ExecDB:
                 return i
         raise ValueError("No batch found with the provided data")
 
-    def search_by_params(self, batch_args, observable_func_name, ibmq_service=None, limit=10):
-        indices = self._search_batches_indices_by_params(batch_args, observable_func_name, limit)
-        batches_to_return = [self._data[i] for i in indices]
-        if ibmq_service is None:
-            return batches_to_return
-        else:
-            jobs_objs = []
-            for batch in batches_to_return:
-                this_jobs_ids = [job["job_id"] for job in batch["jobs"]]
-                this_jobs_objs = [ibmq_service.job(job_id=job_id) for job_id in this_jobs_ids]
-                jobs_objs.append(this_jobs_objs)
-            return jobs_objs
-
-    def search_by_id(self, id, ibmq_service=None):
+    def load_by_params(self, batch_args: dict[str, Any], ibmq_service: QiskitRuntimeService | None = None, limit: int = 10) -> list[list[RuntimeJobV2 | SavedJob]]:
+        jobs_objs = []
+        batches = [self._data[i] for i in self._search_batches_indices_by_params(batch_args, limit)]
+        for batch in batches:
+            this_jobs_ids = [job["job_id"] for job in batch["jobs"]]
+            jobs_objs.append(load_jobs_from_local_or_ibmq(this_jobs_ids, ibmq_service, self.jobs_local_folder))
+        return jobs_objs
+    
+    def load_by_id(self, id: int, ibmq_service: QiskitRuntimeService | None = None) -> list[RuntimeJobV2 | SavedJob]:
         data = self._data[self._search_batch_index_by_id(id)]
-        if ibmq_service is None:
-            return data
-        else:
-            job_ids = [job["job_id"] for job in data["jobs"]]
-            job_objs =  [ibmq_service.job(job_id=job_id) for job_id in job_ids]
-            return job_objs
+        jobs_ids = [job["job_id"] for job in data["jobs"]]
+        return load_jobs_from_local_or_ibmq(jobs_ids, ibmq_service, self.jobs_local_folder)
 
-    def seach_by_data(self, data, ibmq_service=None):
-        data = self._search_batch_index_by_data(data)
-        if ibmq_service is None:
-            return data
-        else:
-            job_ids = [job["job_id"] for job in data["jobs"]]
-            job_objs =  [ibmq_service.job(job_id=job_id) for job_id in job_ids]
-            return job_objs
-    
-    @classmethod
-    def generate_batch_db_data(cls, batch_args, physical_circuits, observable_generating_func_name, job_ids_arr):
-        data_to_add = batch_args
-        try:
-            data_to_add["nqubits_arr"] = sorted(list({len(physical_circuit.layout.final_index_layout()) for physical_circuit in physical_circuits}))
-        except AttributeError:
-            pass
-        data_to_add["depths_arr"] = sorted(list({physical_circuit.depth() for physical_circuit in physical_circuits}))
-        if callable(observable_generating_func_name):
-            data_to_add["observables_func_name"] = observable_generating_func_name.__name__
-        else:
-            data_to_add["observables_func_name"] = str(observable_generating_func_name)
-        data_to_add["jobs"] = [{"job_id": jid, "nqubits": len(physical_circuit.layout.final_index_layout()) if physical_circuit.layout is not None else None, "depth": physical_circuit.depth(), "layout": physical_circuit.layout.final_index_layout() if physical_circuit.layout is not None else None} for jid, physical_circuit in zip(job_ids_arr, physical_circuits)]
-        return data_to_add
-    
-    def add(self, batch_args, ran_circuits, observable_generating_func_name, job_ids_arr):
-        self.reload()
-        thisid = 0 if len(self._data) == 0 else self._data[-1]["id"] + 1
-        data_to_add = {"id": thisid}
-        data_to_add = data_to_add | self.generate_batch_db_data(batch_args, ran_circuits, observable_generating_func_name, job_ids_arr)
-        self._data.append(data_to_add)
-        self.save()
-
-    def add_data(self, data):
-        self.reload()
-        thisid = 0 if len(self._data) == 0 else self._data[-1]["id"] + 1
-        data_contains_id = data.get("id", False)
-        if data_contains_id:
-            data_to_add = data.copy()
-            data_to_add["id"] = thisid
-        else:
-            data_to_add = {"id": thisid} | data
-        self.reload()
-        self._data.append(data_to_add)
-        self.save()
-
-    def remove(self, id):
-        index = self._search_batch_index_by_id(id)
-        self._data.pop(index)
-        self.save()
-
-    def execute_sampler_batch(self, backend, sampler_opt_dict, job_circuits, cal_circuits=None, repeat_cal=False, db_options=None, share_total_shots=False, max_shots=75000):
-        jobs = execution.execute_sampler_batch(backend, sampler_opt_dict, job_circuits, cal_circuits, repeat_cal, db_options, self, share_total_shots, max_shots)
-        return jobs
-
-    def execute_sampler_batch_choosing_layout(self, backend, service, sampler_opt_dict, job_log_circuits, cal_log_circuits=None, repeat_cal=False, db_options=None, share_total_shots=False, optimization_level=3, max_shots=75000):
-        jobs = execution.execute_sampler_batch_choosing_layout(backend, service, sampler_opt_dict, job_log_circuits, cal_log_circuits, repeat_cal, db_options, self, share_total_shots, optimization_level, max_shots)
-        return jobs
-
-    def execute_sampler_batch_choosing_layout_by_batches(self, backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits=None, jobcal_together=False, db_options=None, optimization_level=0):
-        jobs = execution.execute_sampler_batch_choosing_layout_by_batches(backend, sampler_opt_dict, job_log_circuits, batches_first_index, cal_log_circuits, jobcal_together, db_options, self, optimization_level)
-        return jobs
-
-    def execute_znepea_choosing_layout(self, backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
-        jobs = execution.execute_znepea_choosing_layout(backend, job_log_barrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
-        return jobs
-
-    def execute_znepea(self, backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func=None, optimization_level=3):
-        jobs = execution.execute_znepea(backend, job_tbarrier_circuits, parameters_func, db_options, uinst_filter_func, self, optimization_level)
-        return jobs
-
-    # def load_final_samples_from_local_or_ibmq(self, batch_args, ibmq_service, jobs_result_folder, job_index=0, return_data=False, verbose=False):
-    #     jobs_data = self.search_by_params(batch_args, "Sampler", ibmq_service=None, limit=job_index+1)
-    #     try:
-    #         jobs_data = jobs_data[job_index]
-    #     except IndexError:
-    #         raise ValueError(f"No batch found with the provided parameters")
-    #     jobs_ids = [job["job_id"] for job in jobs_data["jobs"]]
-    #     jobs_results = load_results_from_local_or_ibmq(jobs_ids, ibmq_service, jobs_result_folder, verbose=verbose)
-    #     jobs_samples = [samples_from_result(job_result) for job_result in jobs_results]
-    #     jobs_samples = np.array(jobs_samples, dtype=object)
-    #     jobs_shape = jobs_data["jobs_shape"]
-    #     nrepetitions = jobs_data["nrepetitions"]
-    #     cal = jobs_data["cal"]
-    #     repeat_cal = jobs_data["repeat_cal"]
-    #     multirep_combined_samples = group_multirep_samples_dicts(jobs_samples, jobs_shape, nrepetitions, cal, repeat_cal)
-    #     return (*multirep_combined_samples, *((jobs_data,) if return_data else ()))
-
-    def load_final_samples_from_local_or_ibmq(self, batch_args, ibmq_service, jobs_result_folder, job_index=0, return_data=False, verbose=False):
-        jobs_data = self.search_by_params(batch_args, "Sampler", ibmq_service=None, limit=job_index+1)
-        try:
-            jobs_data = jobs_data[job_index]
-        except IndexError:
-            raise ValueError(f"No batch found with the provided parameters")
-        jobs_ids = [job["job_id"] for job in jobs_data["jobs"]]
-        jobs_results = load_results_from_local_or_ibmq(jobs_ids, ibmq_service, jobs_result_folder, verbose=verbose)
-        jobs_shape = jobs_data["job_circuits_shape"]
-        cal_shape = jobs_data["cal_circuits_shape"]
-        nrepetitions = jobs_data.get("nrepetitions", 1)
-        repeat_cal = jobs_data.get("repeat_cal", False)
-        if any(isinstance(job_result, QuantumProgramResult) for job_result in jobs_results):
-            # Executor jobs with a single item each. The item results (registers and measurement flips arrays) are returned as they
-            # are, with shapes job_circuits_shape and cal_circuits_shape, and None for failed jobs
-            if nrepetitions != 1:
-                raise NotImplementedError("Executor batches with repetitions are not supported")
-            if any(job_result is not None and len(job_result) != 1 for job_result in jobs_results):
-                raise NotImplementedError("Only executor jobs with a single item are supported")
-            items = np.empty(len(jobs_results), dtype=object)
-            for i, job_result in enumerate(jobs_results):
-                items[i] = job_result[0] if job_result is not None else None
-            if cal_shape is None:
-                to_return = [items.reshape(jobs_shape)]
-            else:
-                if jobs_shape == cal_shape: # Interleaved as [cal, job, cal, job, ...]
-                    cal_items, job_items = items[0::2], items[1::2]
-                else: # All the calibration jobs first
-                    cal_items, job_items = items[:np.prod(cal_shape)], items[np.prod(cal_shape):]
-                to_return = [job_items.reshape(jobs_shape), cal_items.reshape(cal_shape)]
-            if return_data:
-                to_return.append(jobs_data)
-            return to_return
-        # The PUBs of all the jobs are the circuits of the batch in order, unless there is one job per circuit and every job
-        # runs several PUBs (e.g. the gauge twirling randomizations of z2hm_tdepsb_gaugetwirling_submit.py). Then the PUBs
-        # of each job are kept together and the samples come with an extra last axis of length the number of PUBs per job.
-        jobs_pubs_samples = [samples_from_result(job_result) for job_result in jobs_results]
-        ncircuits = np.prod(jobs_shape)*nrepetitions + (np.prod(cal_shape)*(nrepetitions if repeat_cal else 1) if cal_shape is not None else 0)
-        npubs = {len(pubs_samples) for pubs_samples, job_result in zip(jobs_pubs_samples, jobs_results) if job_result is not None}
-        pubs_shape = ()
-        if sum(len(pubs_samples) for pubs_samples in jobs_pubs_samples) != ncircuits and len(jobs_pubs_samples) == ncircuits and len(npubs) == 1:
-            if cal_shape is not None and jobs_shape != cal_shape:
-                raise NotImplementedError("Jobs with several PUBs are only supported with equal job_circuits_shape and cal_circuits_shape")
-            pubs_shape = (npubs.pop(),)
-            # The PUBs axis goes first since group_multirep_samples_dicts groups along the last axis, failed jobs get empty samples dicts
-            jobs_samples = np.empty((*pubs_shape, len(jobs_pubs_samples)), dtype=object)
-            for i, (pubs_samples, job_result) in enumerate(zip(jobs_pubs_samples, jobs_results)):
-                jobs_samples[:, i] = pubs_samples if job_result is not None else [{} for _ in range(pubs_shape[0])]
-        else:
-            jobs_samples = np.array([samples_dict for pubs_samples in jobs_pubs_samples for samples_dict in pubs_samples], dtype=object)
-        if cal_shape is None:
-            multirep_combined_job_samples = group_multirep_samples_dicts(jobs_samples, (*pubs_shape, *jobs_shape), nrepetitions, cal=False)
-        else:
-            if jobs_shape == cal_shape:
-                multirep_combined_job_samples, multirep_combined_cal_samples = group_multirep_samples_dicts(jobs_samples, (*pubs_shape, *jobs_shape), nrepetitions, cal=True, repeat_cal=repeat_cal)
-            else:
-                cal_nrepetitions = nrepetitions if repeat_cal else 1
-                cal_samples = jobs_samples[:np.prod(cal_shape)*cal_nrepetitions].reshape(cal_shape[0]*cal_nrepetitions, cal_shape[1])
-                jobs_samples = jobs_samples[np.prod(cal_shape)*cal_nrepetitions:].reshape(jobs_shape[0]*nrepetitions, jobs_shape[1])
-                multirep_combined_job_samples = group_multirep_samples_dicts(jobs_samples, jobs_shape, nrepetitions, cal=False)
-                multirep_combined_cal_samples = group_multirep_samples_dicts(cal_samples, cal_shape, cal_nrepetitions, cal=False)
-        if pubs_shape:
-            multirep_combined_job_samples = np.moveaxis(multirep_combined_job_samples, 0, -1)
-            if cal_shape is not None:
-                multirep_combined_cal_samples = np.moveaxis(multirep_combined_cal_samples, 0, -1)
-        to_return = [multirep_combined_job_samples]
-        if cal_shape is not None:
-            to_return.append(multirep_combined_cal_samples)
-        if return_data:
-            to_return.append(jobs_data)
-        return to_return
-
-    def load_jobs_from_local_or_ibmq(self, batch_args, ibmq_service, job_index=0, return_data=False, verbose=False):
-        jobs_data = self.search_by_params(batch_args, "Sampler", ibmq_service=None, limit=job_index+1)
-        try:
-            jobs_data = jobs_data[job_index]
-        except IndexError:
-            raise ValueError(f"No batch found with the provided parameters")
-        jobs_ids = [job["job_id"] for job in jobs_data["jobs"]]
-        jobs_objs = load_jobs_from_local_or_ibmq(jobs_ids, ibmq_service, verbose=verbose)
-        to_return = [jobs_objs]
-        if return_data:
-            to_return.append(jobs_data)
-        return to_return
-
-def load_job_result(filepath):
-    with open(filepath, "r") as f:
-        result = json.load(f, cls=RuntimeDecoder)
-    return result
-
-def save_job_result(filepath, job):
-    result = job.result()
-    if isinstance(result, QuantumProgramResult):
-        # Executor results are not JSON serializable, their arrays are saved in a compressed npz file next to filepath
-        save_quantum_program_result(os.path.splitext(filepath)[0] + ".npz", result)
-    else:
-        to_save = result
-        if dataclasses.is_dataclass(result.metadata.get("executor")):
-            # Executor Sampler results (decoded to SamplerV2 format) carry the executor metadata as a dataclass, saved as a dict
-            to_save = PrimitiveResult(list(result), metadata=result.metadata | {"executor": dataclasses.asdict(result.metadata["executor"])})
-        serialized = json.dumps(to_save, cls=RuntimeEncoder)    # before opening the file, so that a failure leaves no partial file
-        with open(filepath, "w") as f:
-            f.write(serialized)
-    return result
-
-def save_quantum_program_result(filepath, result):
-    # Only the arrays of the items are saved, as "<item index>/<key>", not the metadata
-    arrays = {f"{i}/{key}": np.asarray(value) for i, item in enumerate(result) for key, value in item.items()}
-    np.savez_compressed(filepath, **arrays)
-
-def load_quantum_program_result(filepath):
-    items = {}
-    with np.load(filepath) as npz:
-        for name in npz.files:
-            item_index, key = name.split("/", 1)
-            items.setdefault(int(item_index), {})[key] = npz[name]
-    return QuantumProgramResult([items[i] for i in sorted(items)])
-
-def load_results_from_local_or_ibmq(job_ids, ibmq_service, jobs_result_folder="", verbose=False):
-    job_results = []
-    for job_id in job_ids:
-        if verbose: print(f"\rLoading job {job_id}...".ljust(100), end="")
-        if os.path.isdir(jobs_result_folder):
-            job_filepath = os.path.join(jobs_result_folder, f"{job_id}.json")
-            executor_job_filepath = os.path.join(jobs_result_folder, f"{job_id}.npz")
-            if os.path.isfile(job_filepath):
-                job_result = load_job_result(job_filepath)
-            elif os.path.isfile(executor_job_filepath):
-                job_result = load_quantum_program_result(executor_job_filepath)
-            else:
-                job_obj = ibmq_service.job(job_id=job_id)
-                try:
-                    job_result = save_job_result(job_filepath, job_obj)
-                except (RuntimeJobFailureError, RuntimeInvalidStateError):
-                    job_result = None
-        else:
-            job_obj = ibmq_service.job(job_id=job_id)
-            if job_obj.status() == "QUEUED":
-                warnings.warn(f"Job {job_id} is still QUEUED. Waiting for it to complete...", UserWarning, stacklevel=2)
-            if job_obj.status() == "RUNNING":
-                warnings.warn(f"Job {job_id} is still RUNNING. Waiting for it to complete...", UserWarning, stacklevel=2)
-            try:
-                job_result = job_obj.result()
-            except RuntimeJobFailureError:
-                job_result = None
-        job_results.append(job_result)
-    return job_results
-
-def load_jobs_from_local_or_ibmq(job_ids, ibmq_service, verbose=False):
-    jobs = []
-    for job_id in job_ids:
-        if verbose: print(f"\rLoading job {job_id}...".ljust(100), end="")
-        job_obj = ibmq_service.job(job_id=job_id)
-        if job_obj.status() == "QUEUED":
-            warnings.warn(f"Job {job_id} is still QUEUED. Waiting for it to complete...", UserWarning, stacklevel=2)
-        if job_obj.status() == "RUNNING":
-            warnings.warn(f"Job {job_id} is still RUNNING. Waiting for it to complete...", UserWarning, stacklevel=2)
-        jobs.append(job_obj)
-    return jobs
-
-def samples_from_result(job_result):
-    # if job_result is None:
-    #     return {}
-    # try:
-    #     job_result = job_result[0]
-    # except (IndexError, TypeError):
-    #     pass
-    # samples = list(dict(job_result.data).values())[0].get_counts()
-    # return samples
-    if job_result is None:
-        return [{}]
-    elif isinstance(job_result, QuantumProgramResult):
-        samples = [res for res in job_result]
-        return samples
-    else:
-        samples = [list(dict(res.data).values())[0].get_counts() for res in job_result]
-        return samples
+    def load_by_data(self, data: Batch, ibmq_service: QiskitRuntimeService | None = None) -> list[RuntimeJobV2 | SavedJob]:
+        data = self._data[self._search_batch_index_by_data(data)]
+        jobs_ids = [job["job_id"] for job in data["jobs"]]
+        return load_jobs_from_local_or_ibmq(jobs_ids, ibmq_service, self.jobs_local_folder)
