@@ -320,17 +320,18 @@ class _StepDrawer:
                 self.qubit(qubit, fc, conditional)
                 self.label(qubit, gate_text, gt)
 
-def _draw_step(lattice: Lattice, steps: list[list[_Instruction]], i: int, scale: float, number_qubits: bool) -> Figure:
+def _draw_step(lattice: Lattice, steps: list[list[_Instruction]], i: int, scale: float, number_qubits: bool, title: bool = True) -> Figure:
     if not -len(steps) <= i < len(steps):
         raise IndexError(f"Step {i} out of range for a circuit with {len(steps)} steps")
     lattice.plot(scale=scale, number_qubits=number_qubits)
     fig, ax = plt.gcf(), plt.gca()
-    # Extra band on top of the figure for the title, keeping the size of the lattice
-    band = 0.25*scale
-    width, height = fig.get_size_inches()
-    pos = ax.get_position()
-    fig.set_size_inches(width, height + band)
-    ax.set_position([pos.x0, pos.y0*height/(height + band), pos.width, pos.height*height/(height + band)])
+    if title:
+        # Extra band on top of the figure for the title, keeping the size of the lattice
+        band = 0.25*scale
+        width, height = fig.get_size_inches()
+        pos = ax.get_position()
+        fig.set_size_inches(width, height + band)
+        ax.set_position([pos.x0, pos.y0*height/(height + band), pos.width, pos.height*height/(height + band)])
     drawer = _StepDrawer(ax, lattice, scale)
     for instr in steps[i]:
         drawer.instruction(instr)
@@ -338,7 +339,8 @@ def _draw_step(lattice: Lattice, steps: list[list[_Instruction]], i: int, scale:
     active = {q for instr in steps[i] for q in instr.qubits}
     for q in set(range(len(lattice))) - active:
         drawer.qubit(q, "white", False, zorder=2.75)
-    ax.set_title(f"Step {i % len(steps)}", fontfamily="serif", fontsize=8*scale)
+    if title:
+        ax.set_title(f"Step {i % len(steps)}", fontfamily="serif", fontsize=8*scale)
     return fig
 
 def _check_sizes(lattice: Lattice, circuit: QuantumCircuit) -> None:
@@ -355,7 +357,7 @@ def plot_step(lattice: Lattice, circuit: QuantumCircuit, i: int, scale: float = 
     if filepath is not None:
         fig.savefig(filepath, dpi=300, facecolor="none")
 
-def _render_frames(lattice: Lattice, circuit: QuantumCircuit, step_range: range | None, scale: float, number_qubits: bool, dpi: int) -> list[PIL.Image.Image]:
+def _render_frames(lattice: Lattice, circuit: QuantumCircuit, step_range: range | None, scale: float, number_qubits: bool, dpi: int, titles: bool = True) -> list[PIL.Image.Image]:
     _check_sizes(lattice, circuit)
     steps = circuit_steps(circuit)
     indices = range(len(steps)) if step_range is None else step_range
@@ -363,22 +365,24 @@ def _render_frames(lattice: Lattice, circuit: QuantumCircuit, step_range: range 
         raise ValueError("No steps to plot")
     frames = []
     for i in indices:
-        fig = _draw_step(lattice, steps, i, scale, number_qubits)
+        fig = _draw_step(lattice, steps, i, scale, number_qubits, titles)
         buffer = io.BytesIO()
         fig.savefig(buffer, format="png", dpi=dpi, facecolor="white")
         plt.close(fig)
         frames.append(PIL.Image.open(buffer).convert("RGB"))
     return frames
 
-def plot_steps_grid(lattice: Lattice, circuit: QuantumCircuit, step_range: range | None = None, ncols: int | None = None, scale: float = 1.5, number_qubits: bool = False, dpi: int = 200, filepath: str | os.PathLike | None = None) -> None:
+def plot_steps_grid(lattice: Lattice, circuit: QuantumCircuit, step_range: range | None = None, ncols: int | None = None, scale: float = 1.5, number_qubits: bool = False, titles: bool = True, dpi: int = 200, filepath: str | os.PathLike | None = None) -> None:
     """Plots the steps of the circuit side by side in a single figure, each one as drawn by plot_step
     Arguments:
         step_range:
             Steps to plot, e.g. range(2, 10). All of them if None
         ncols:
             Number of columns of the grid. If None, the grid is as square as possible
+        titles:
+            Whether to show the "Step i" title above each step
     """
-    frames = _render_frames(lattice, circuit, step_range, scale, number_qubits, dpi)
+    frames = _render_frames(lattice, circuit, step_range, scale, number_qubits, dpi, titles)
     ncols = math.ceil(math.sqrt(len(frames))) if ncols is None else ncols
     nrows = math.ceil(len(frames)/ncols)
     width, height = frames[0].size
