@@ -5,13 +5,11 @@ from qiskit.transpiler import generate_preset_pass_manager
 from collections.abc import Callable, Sequence
 import hardware.utils.circs as circutils
 from samplomatic.samplex import Samplex
-from samplomatic.utils import unbox
 from qiskit.providers import BackendV2
 from hardware.utils.jobdb import JobDB
-from qiskit.circuit import BoxOp
+from samplomatic.utils import unbox
 from typing import Any
 import numpy as np
-import copy
 
 def backends_objs_to_names(backends_arr: BackendV2 | Sequence[BackendV2] | str | Sequence[str]) -> str | list[str]:
     if type(backends_arr) == str:

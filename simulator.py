@@ -71,6 +71,6 @@ def simulate_estimator(circuits: QuantumCircuit, observables: Sequence[Sequence[
     pm = generate_preset_pass_manager(backend=backend)
     transpiled_circuits = pm.run(circuits.tolist())
     # The observables follow the qubits of each circuit through the layout chosen by the transpiler
-    job = estimator.run([(circ, [ob.apply_layout(circ.layout) for ob in obs]) for circ, obs in zip(transpiled_circuits, observables, strict=True)])
+    job = estimator.run([(circ, [ob.apply_layout(circ.layout) for ob in observables]) for circ in transpiled_circuits])
     evs = [result.data.evs for result in job.result()]
     return evs
